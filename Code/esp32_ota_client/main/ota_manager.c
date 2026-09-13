@@ -1,0 +1,418 @@
+#include <stdlib.h>
+#include <strings.h>
+
+#include "esp_http_client.h"
+#include "esp_ota_ops.h"
+#include "esp_log.h"
+
+#include "mbedtls/md.h"
+
+static const char *TAG = "ota_manager";
+
+#define OTA_BUFFER_SIZE 4096
+
+esp_err_t ota_print_partition_info(void)
+{
+    const esp_partition_t *running =
+        esp_ota_get_running_partition();
+
+    if (running == NULL)
+    {
+        ESP_LOGE(TAG, "Could not get running partition");
+        return ESP_FAIL;
+    }
+
+    ESP_LOGI(
+        TAG,
+        "Running partition: %s",
+        running->label
+    );
+
+    ESP_LOGI(
+        TAG,
+        "Running partition address: 0x%lx",
+        running->address
+    );
+
+    ESP_LOGI(
+        TAG,
+        "Running partition size: %lu bytes",
+        running->size
+    );
+
+    const esp_partition_t *next =
+        esp_ota_get_next_update_partition(NULL);
+
+    if (next == NULL)
+    {
+        ESP_LOGE(TAG, "Could not find next OTA partition");
+        return ESP_FAIL;
+    }
+
+    ESP_LOGI(
+        TAG,
+        "Next OTA partition: %s",
+        next->label
+    );
+
+    ESP_LOGI(
+        TAG,
+        "Next OTA partition address: 0x%lx",
+        next->address
+    );
+
+    ESP_LOGI(
+        TAG,
+        "Next OTA partition size: %lu bytes",
+        next->size
+    );
+
+    return ESP_OK;
+}
+
+esp_err_t ota_install_from_url(
+    const char *firmware_url,
+    const char *expected_sha256)
+{
+    if (
+        (firmware_url == NULL) ||
+        (expected_sha256 == NULL)
+    )
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    ESP_LOGI(TAG, "Starting OTA update");
+    ESP_LOGI(TAG, "Firmware URL: %s", firmware_url);
+
+    const esp_partition_t *update_partition =
+        esp_ota_get_next_update_partition(NULL);
+
+    if (update_partition == NULL)
+    {
+        ESP_LOGE(TAG, "No OTA partition available");
+        return ESP_FAIL;
+    }
+
+    ESP_LOGI(
+        TAG,
+        "Target partition: %s",
+        update_partition->label
+    );
+
+    esp_http_client_config_t config = {
+        .url = firmware_url,
+        .timeout_ms = 10000,
+        .buffer_size = OTA_BUFFER_SIZE,
+    };
+
+    esp_http_client_handle_t client =
+        esp_http_client_init(&config);
+
+    if (client == NULL)
+    {
+        ESP_LOGE(TAG, "Failed to initialize HTTP client");
+        return ESP_FAIL;
+    }
+
+    esp_err_t err = esp_http_client_open(client, 0);
+
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(
+            TAG,
+            "Failed to open HTTP connection: %s",
+            esp_err_to_name(err)
+        );
+
+        esp_http_client_cleanup(client);
+        return err;
+    }
+
+    int64_t content_length =
+        esp_http_client_fetch_headers(client);
+
+    int status_code =
+        esp_http_client_get_status_code(client);
+
+    if (status_code != 200)
+    {
+        ESP_LOGE(
+            TAG,
+            "Server returned HTTP %d",
+            status_code
+        );
+
+        esp_http_client_close(client);
+        esp_http_client_cleanup(client);
+
+        return ESP_FAIL;
+    }
+
+    if (content_length > update_partition->size)
+    {
+        ESP_LOGE(
+            TAG,
+            "Firmware is too large: %lld bytes",
+            content_length
+        );
+
+        esp_http_client_close(client);
+        esp_http_client_cleanup(client);
+
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    ESP_LOGI(
+        TAG,
+        "Firmware size: %lld bytes",
+        content_length
+    );
+
+    esp_ota_handle_t ota_handle;
+
+    err = esp_ota_begin(
+        update_partition,
+        content_length,
+        &ota_handle
+    );
+
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(
+            TAG,
+            "esp_ota_begin failed: %s",
+            esp_err_to_name(err)
+        );
+
+        esp_http_client_close(client);
+        esp_http_client_cleanup(client);
+
+        return err;
+    }
+
+    uint8_t *buffer = malloc(OTA_BUFFER_SIZE);
+
+    if (buffer == NULL)
+    {
+        ESP_LOGE(TAG, "Could not allocate OTA buffer");
+
+        esp_ota_abort(ota_handle);
+        esp_http_client_close(client);
+        esp_http_client_cleanup(client);
+
+        return ESP_ERR_NO_MEM;
+    }
+
+    size_t total_written = 0;
+
+    mbedtls_md_context_t sha_ctx;
+
+    mbedtls_md_init(&sha_ctx);
+
+    const mbedtls_md_info_t *sha_info =
+        mbedtls_md_info_from_type(
+            MBEDTLS_MD_SHA256
+        );
+
+    mbedtls_md_setup(
+        &sha_ctx,
+        sha_info,
+        0
+    );
+
+    mbedtls_md_starts(
+        &sha_ctx
+    );
+
+    while (1)
+    {
+        int read_len = esp_http_client_read(
+            client,
+            (char *)buffer,
+            OTA_BUFFER_SIZE
+        );
+
+        if (read_len < 0)
+        {
+            ESP_LOGE(TAG, "HTTP read failed");
+
+            free(buffer);
+            esp_ota_abort(ota_handle);
+            esp_http_client_close(client);
+            esp_http_client_cleanup(client);
+
+            return ESP_FAIL;
+        }
+
+        if (read_len == 0)
+        {
+            break;
+        }
+
+        mbedtls_md_update(
+            &sha_ctx,
+            buffer,
+            read_len
+        );
+
+        err = esp_ota_write(
+            ota_handle,
+            buffer,
+            read_len
+        );
+
+        if (err != ESP_OK)
+        {
+            ESP_LOGE(
+                TAG,
+                "OTA write failed: %s",
+                esp_err_to_name(err)
+            );
+
+            free(buffer);
+            esp_ota_abort(ota_handle);
+            esp_http_client_close(client);
+            esp_http_client_cleanup(client);
+
+            return err;
+        }
+
+        total_written += read_len;
+
+        ESP_LOGI(
+            TAG,
+            "Written %u bytes",
+            (unsigned int)total_written
+        );
+    }
+    free(buffer);
+
+    esp_http_client_close(client);
+    esp_http_client_cleanup(client);
+
+    unsigned char hash[32];
+    char calculated_sha256[65];
+
+    mbedtls_md_finish(
+        &sha_ctx,
+        hash
+    );
+
+    mbedtls_md_free(
+        &sha_ctx
+    );
+
+    for (int i = 0; i < 32; i++)
+    {
+        sprintf(
+            &calculated_sha256[i * 2],
+            "%02x",
+            hash[i]
+        );
+    }
+
+    calculated_sha256[64] = '\0';
+
+    ESP_LOGI(
+        TAG,
+        "Calculated SHA-256: %s",
+        calculated_sha256
+    );
+
+
+    ESP_LOGI(
+        TAG,
+        "Expected SHA-256: %s",
+        expected_sha256
+    );
+
+    if (strcasecmp(
+            calculated_sha256,
+            expected_sha256) != 0)
+    {
+        ESP_LOGE(
+            TAG,
+            "SHA-256 verification failed"
+        );
+
+        esp_ota_abort(
+            ota_handle
+        );
+
+        return ESP_ERR_INVALID_CRC;
+    }
+    else 
+    {
+        ESP_LOGI(
+            TAG,
+            "SHA-256 verification successful"
+        ); 
+    }
+
+    err = esp_ota_end(ota_handle);
+
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(
+            TAG,
+            "esp_ota_end failed: %s",
+            esp_err_to_name(err)
+        );
+
+        return err;
+    }
+
+    esp_ota_img_states_t ota_state;
+
+    if (esp_ota_get_state_partition(
+            update_partition,
+            &ota_state) == ESP_OK)
+    {
+        ESP_LOGI(
+            TAG,
+            "Target partition state before boot: %d",
+            ota_state
+        );
+    }
+
+
+    err = esp_ota_set_boot_partition(
+        update_partition
+    );
+
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(
+            TAG,
+            "Failed to set boot partition: %s",
+            esp_err_to_name(err)
+        );
+
+        return err;
+    }
+
+
+    const esp_partition_t *boot_partition =
+        esp_ota_get_boot_partition();
+
+
+    ESP_LOGI(
+        TAG,
+        "Boot partition after set: %s",
+        boot_partition->label
+    );
+
+    ESP_LOGI(
+        TAG,
+        "OTA completed successfully"
+    );
+
+    ESP_LOGI(
+        TAG,
+        "Next boot partition: %s",
+        update_partition->label
+    );
+
+    return ESP_OK;
+}
